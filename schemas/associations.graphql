@@ -1,0 +1,9 @@
+# Learned co-occurrence associations between products, built from session patterns
+# id format: "{productId}>{associatedProductId}" — stored in both directions
+type ProductAssociation @table {
+	id: ID @primaryKey
+	productId: ID @indexed
+	associatedProductId: ID @indexed
+	weight: Float
+	lastSeen: Float
+}

@@ -1,0 +1,15 @@
+# Product cache — populated on first encounter from origin API.
+# expiration drives the sourcedFrom TTL (default 24 h, override via PRODUCT_CACHE_TTL_SECONDS).
+# Not @export: managed exclusively through the recommendations resource.
+type Product @table(expiration: 86400) {
+	id: ID @primaryKey
+	name: String @indexed
+	description: String
+	price: Float
+	category: String @indexed
+	sku: String
+	imageUrl: String
+	metadata: String
+	fetchedAt: Float
+	textContent: String
+}
