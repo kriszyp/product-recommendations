@@ -8,7 +8,7 @@
  *   GET {ORIGIN_PRODUCT_API_URL}/products/{id}
  */
 
-import { Resource, tables } from 'harperdb';
+import { Resource, tables } from 'harper';
 
 const ORIGIN_API_URL = process.env.ORIGIN_PRODUCT_API_URL ?? '';
 const ORIGIN_API_KEY = process.env.ORIGIN_PRODUCT_API_KEY ?? '';
