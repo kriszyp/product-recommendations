@@ -1,26 +1,91 @@
 # Product Recommendations Engine
 
-A Harper application that delivers real-time, low-latency product recommendations by combining two complementary signals: **learned session associations** that improve continuously over time, and **text similarity bootstrapping** that produces useful results from day one.
+A Harper application that delivers real-time, low-latency product recommendations. The engine combines multiple learned and content-based signals that improve continuously as traffic grows, with no offline training pipeline or external ML infrastructure required.
 
-## How It Works
+---
 
-### Dual-Signal Recommendation Engine
+## Recommendation Techniques
 
-**1. Session-based association learning (primary signal)**
+The engine stacks five complementary techniques. Each one addresses a different failure mode of simple co-occurrence counting, and they compose cleanly because they all operate on the same two Harper tables.
 
-Every time a user views a product, the engine records a co-occurrence association between that product and everything else the user looked at earlier in the same session. These associations are stored as weighted edges in a `ProductAssociation` table — the more often two products appear together in sessions, the higher their shared weight. Over time this builds a product graph that reflects real browsing behaviour: users who buy running shoes also look at compression socks, users researching laptops also view monitors and keyboards.
+### 1. Session co-occurrence graph (primary signal)
 
-**2. Text similarity bootstrapping (cold-start signal)**
+Every time a user views a product, the engine records a co-occurrence between that product and everything else the user looked at earlier in the same session. These associations are stored as weighted directed edges in the `ProductAssociation` table (`A→B` and `B→A` stored separately for fast single-key queries). Over time this builds a product graph reflecting real browsing behaviour — users who look at running shoes also look at compression socks, users researching laptops also view monitors and keyboards.
 
-Before enough session data has accumulated, the engine falls back to Jaccard similarity on tokenised product text (name, description, category, SKU). This ensures new products and new deployments produce meaningful recommendations immediately, without waiting for traffic to build up the association graph. Once the association graph has enough strong edges for a given product, the text scan is skipped entirely.
+**Recency weighting within a session:** Not all co-occurrences are equally informative. A product viewed moments ago is a stronger signal than one viewed ten clicks back. Each edge increment uses an inverse-position weight: `delta = 1 / (position + 1)`, so position 0 (most recent) contributes `1.0`, position 1 contributes `0.5`, position 2 contributes `0.33`, and so on. This is applied atomically via Harper's `table.update(id).addTo('weight', delta)`, so concurrent requests from different nodes never produce corrupt weights.
 
-### Product Caching
+### 2. Temporal decay
 
-Product details are fetched from a configurable external origin API (modelled after the Salesforce Commerce Cloud product API) and cached in Harper's `Product` table. Harper's `sourcedFrom` mechanism handles cache misses transparently — any `Product.get(id)` that isn't already cached triggers a background fetch from the origin API and stores the result. Cache entries expire after 24 hours (configurable) and are refreshed on next access. If the origin API is unavailable, stale cache is served rather than failing.
+Raw co-occurrence counts accumulate forever, meaning a browsing pattern from two years ago carries the same weight as one from yesterday. The engine applies **exponential decay** at query time using the `lastSeen` timestamp that is already stored on every association record:
 
-### Session Tracking
+```
+effectiveWeight = storedWeight × 2^( −age / halfLife )
+```
 
-Each user's session is tracked using Harper's built-in cookie-based sessions (`getContext().session`). The session stores a rolling list of recently viewed product IDs. Associations are built incrementally from this list on every request, so the recommendation graph continuously improves without any batch processing or scheduled jobs.
+With a 30-day half-life (configurable via `DECAY_HALF_LIFE_MS`), an association that has not been reinforced in 30 days contributes half as much as a fresh one; after 90 days it contributes one eighth. Seasonal products naturally fade between seasons and re-emerge when browsing patterns return. No batch job or scheduled cleanup is needed — the decay is a pure computation at read time.
+
+### 3. Popularity normalization (PMI-style)
+
+A naive co-occurrence graph over-recommends globally popular products. A bestselling item that appears in thousands of sessions will accumulate high edge weights to almost every other product, even ones it has no real affinity with. This is the recommendation equivalent of a stopword problem.
+
+The fix is a lightweight approximation of **Pointwise Mutual Information** normalized by product popularity:
+
+```
+score(A→B) = decayedWeight(A→B) / √( totalCoOccurrences(A) × totalCoOccurrences(B) )
+```
+
+`totalCoOccurrences` is maintained per product in a `ProductStats` table, incremented atomically alongside every edge write. Dividing by the geometric mean of both products' marginal frequencies means the score is high only when A and B appear together *more often than their individual popularities would predict* — the true definition of association.
+
+### 4. Second-order graph traversal (friends-of-friends)
+
+Direct associations only exist between products that have literally appeared in the same session. New products have no direct edges. Products in niche categories may have very few sessions. In both cases, the first-hop graph alone produces too few candidates to fill the recommendation list.
+
+The engine expands the top-5 first-hop neighbours one level further, accumulating indirect candidates at a discounted weight:
+
+```
+indirectScore(A→C) = score(A→B) × decayedWeight(B→C) × discount
+```
+
+`SECOND_ORDER_DISCOUNT` defaults to 0.3. The `scores.has(target)` guard ensures second-hop scores never overwrite stronger direct scores. Worst-case cost is `5 × 20 = 100` additional Harper reads per request — all served from local replicated storage, sub-millisecond each.
+
+### 5. Semantic similarity (cold-start bootstrapping)
+
+The association graph is empty on day one and sparse for new products regardless of how much general traffic the system receives. The engine supplements association scores with a content-based similarity signal to ensure useful recommendations are returned even before any learning has occurred.
+
+**Jaccard similarity (no dependencies):** The default. Each product's `textContent` field stores a deduplicated token set built from name, description, category, and SKU. Jaccard similarity — intersection size divided by union size — between the current product's tokens and every cached product is computed in a single pass. Candidates above `TEXT_SIM_THRESHOLD` (default `0.05`) contribute `similarity × SEMANTIC_WEIGHT` to the score map. This requires no external services and works immediately after deployment.
+
+**HNSW vector similarity (optional, much more accurate):** When `EMBEDDING_PROVIDER` is set, the `textContent` string is sent to an embedding API (OpenAI `text-embedding-3-small` or Ollama `nomic-embed-text`) and the resulting vector is stored in a `textEmbedding: [Float]` field that carries an `@indexed(type: "HNSW", distance: "cosine")` directive. Harper maintains the HNSW index incrementally. At query time, a single approximate nearest-neighbour search replaces the O(n) Jaccard scan:
+
+```
+vectorScore(B) = 1 − cosineDistance(embedding(A), embedding(B)) / 2
+```
+
+Embeddings are generated **lazily on first encounter** and persisted via a fire-and-forget patch — they never block the response. Existing products gain embeddings as their cache entries cycle through normal expiration. The Jaccard fallback remains active for products whose embeddings have not yet been generated.
+
+The key advantage of vector embeddings over Jaccard: "running shoes" and "jogging sneakers" have zero token overlap but high cosine similarity. Synonyms, paraphrases, and cross-language product names all resolve correctly.
+
+### 6. Diversity re-ranking
+
+Score-ranked top-K lists frequently cluster in one category. A user viewing a laptop might receive ten monitors and zero keyboards, mice, or bags — technically high-scoring but not a useful list.
+
+After building the scored candidate pool, the engine **over-fetches** `MAX_RECOMMENDATIONS × DIVERSITY_OVERSAMPLE` (default 3×) candidates and applies a greedy Maximal Marginal Relevance-style re-rank:
+
+- **Soft penalty:** each additional recommendation from the same `category` already in the final list has its score multiplied by `CATEGORY_PENALTY^count` (default `0.5` — halves per repeat)
+- **Hard cap:** `MAX_PER_CATEGORY` slots per category (default 3) — no category can monopolise the list
+
+Products without a `category` field share an `__unknown__` bucket. The re-ranker is O(candidates × targetCount) with category data fetched in the same `Promise.all` batch as the final product detail reads, so it adds no extra round-trips.
+
+### How the signals combine
+
+All six signals feed into a single `scores` map. The final score going into diversity re-ranking is:
+
+| Signal | Formula | Scale |
+|---|---|---|
+| Association (PMI-normalized) | `decayedWeight(A→B) / √(totalA × totalB) × ASSOC_WEIGHT` | 0–10 |
+| Second-order (indirect) | `firstHopScore × decayedWeight(B→C) × SECOND_ORDER_DISCOUNT` | 0–3 |
+| Semantic (vector or Jaccard) | `similarity × SEMANTIC_WEIGHT` | 0–5 |
+
+Before the diversity re-ranker, scores are min-max normalized to a 0–100 range across the candidate pool. The `score` field in the API response reflects this normalized value.
 
 ---
 
@@ -65,14 +130,14 @@ curl -X POST http://localhost:9926/recommendations/ \
       "price": 24.99,
       "category": "Accessories",
       "imageUrl": "...",
-      "score": 18.4
+      "score": 84.2
     }
   ],
   "sessionHistory": ["prod-abc-123", "prod-xyz-789"]
 }
 ```
 
-The `score` field reflects a combination of association weight and text similarity — higher means stronger signal.
+`score` is normalized to 0–100 within the response's candidate pool. Higher means a stronger combined signal.
 
 ---
 
@@ -80,11 +145,11 @@ The `score` field reflects a combination of association weight and text similari
 
 ### Low-latency at the edge
 
-Deployed to a Harper Fabric cluster, the product graph and product cache are replicated across every node globally. A user in Tokyo and a user in London both read from their nearest node — no round-trip to a central database. Recommendation lookups are served from local memory-mapped storage.
+Deployed to a Harper Fabric cluster, the product graph and product cache are replicated across every node globally. A user in Tokyo and a user in London both read from their nearest node — no round-trip to a central database. Recommendation lookups are served from local in-process storage.
 
 ### Associations update in real time across the cluster
 
-Harper's replication propagates association weight increments across the cluster automatically. A browsing pattern that appears on nodes in Frankfurt immediately strengthens the same association edges on nodes in Singapore. The recommendation model improves globally without any centralised aggregation step.
+Harper's replication propagates association weight increments across the cluster automatically. A browsing pattern that appears on nodes in Frankfurt immediately strengthens the same association edges on nodes in Singapore. The recommendation model improves globally without any centralised aggregation step or batch retraining.
 
 ### Composition with Harper's page and API caching
 
@@ -101,17 +166,13 @@ Harper Node (nearest)
   └─ /recommendations/    (this component — live, session-aware, no cache)
 ```
 
-The product recommendation endpoint is intentionally **not cached at the HTTP layer** — each request is session-specific and must read the current association graph. However, the underlying `Product` table lookups that happen inside the endpoint are served from Harper's in-process storage (effectively in-memory), so the individual record reads are already as fast as a cache hit.
+The recommendation endpoint is intentionally not cached at the HTTP layer — each request is session-specific and must read the current association graph. However, the underlying `Product` and `ProductAssociation` table lookups are served from Harper's in-process storage, so individual record reads are already as fast as a cache hit.
 
-For higher-traffic deployments, the recommendations response for anonymous (cookieless) users could be cached at the page level per product ID, since those requests carry no session context. Personalised responses (users with session history) bypass the page cache automatically.
+For higher-traffic deployments, recommendations for anonymous (cookieless) users can be cached per product ID at the page layer, since those requests carry no session context. Personalised responses bypass the page cache automatically.
 
 ### No external ML infrastructure required
 
-The recommendation model lives entirely inside Harper tables. There is no separate vector database, no offline training pipeline, no model serving infrastructure. The association graph is updated inline with every request. This makes the system operationally simple: deploying the recommendation engine is just deploying a Harper component.
-
-### Extensibility with vector search
-
-When richer semantic similarity is needed — for example, to recommend visually similar products or handle synonymous search terms — Harper's built-in HNSW vector index can be added to the `Product` table. Embeddings generated by OpenAI, Ollama, or any other provider can be stored alongside product records, and Harper's vector search replaces the Jaccard text scan with a single ANN query. The association learning layer works identically regardless of which similarity method is used underneath.
+The recommendation model lives entirely inside Harper tables. There is no separate vector database, no offline training pipeline, no model serving infrastructure, and no scheduled jobs. The association graph and popularity statistics are updated inline with every request using Harper's atomic increment operations. Deploying the recommendation engine is just deploying a Harper component.
 
 ---
 
@@ -123,28 +184,40 @@ Cached product details from the origin API. Expires after `PRODUCT_CACHE_TTL_SEC
 
 | Field | Type | Notes |
 |---|---|---|
-| `id` | ID | Product ID (primary key) |
-| `name` | String | Indexed for lookup |
+| `id` | ID | Primary key |
+| `name` | String | Indexed |
 | `description` | String | |
 | `price` | Float | |
-| `category` | String | Indexed |
+| `category` | String | Indexed; used for diversity re-ranking |
 | `sku` | String | |
 | `imageUrl` | String | |
 | `metadata` | String | Raw origin API response (JSON) |
 | `fetchedAt` | Float | Unix ms timestamp of last fetch |
-| `textContent` | String | Tokenised text used for Jaccard similarity |
+| `textContent` | String | Deduplicated token string for Jaccard similarity |
+| `textEmbedding` | [Float] | HNSW-indexed vector; populated lazily when `EMBEDDING_PROVIDER` is set |
+| `embeddingVersion` | String | Provider + model tag; used to detect stale vectors |
 
 ### `ProductAssociation` table
 
-Learned co-occurrence edges. A record exists for every ordered pair `(A, B)` that has ever appeared in the same session — both `A→B` and `B→A` are stored, so queries only need to filter on `productId`.
+Learned co-occurrence edges. Both directions `A→B` and `B→A` are stored so queries only need to filter on `productId`.
 
 | Field | Type | Notes |
 |---|---|---|
 | `id` | ID | `"{productId}>{associatedProductId}"` |
 | `productId` | ID | Indexed |
 | `associatedProductId` | ID | Indexed |
-| `weight` | Float | Co-occurrence count; incremented atomically |
-| `lastSeen` | Float | Unix ms timestamp of last co-occurrence |
+| `weight` | Float | Recency-weighted co-occurrence sum; incremented atomically |
+| `lastSeen` | Float | Timestamp of last co-occurrence; used for temporal decay |
+
+### `ProductStats` table
+
+Per-product aggregate co-occurrence totals for PMI normalization. Access is always by primary key.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | Mirrors `Product.id` |
+| `totalCoOccurrences` | Float | Running sum of all outbound association increments |
+| `lastUpdated` | Float | |
 
 ---
 
@@ -155,13 +228,29 @@ All tuning parameters are set via environment variables. Copy `.env.example` to 
 | Variable | Default | Description |
 |---|---|---|
 | `ORIGIN_PRODUCT_API_URL` | — | Base URL for origin product API (Salesforce Commerce Cloud compatible) |
-| `ORIGIN_PRODUCT_API_KEY` | — | Bearer token for origin API (omit if not required) |
+| `ORIGIN_PRODUCT_API_KEY` | — | Bearer token for origin API |
 | `PRODUCT_CACHE_TTL_SECONDS` | `86400` | Product cache lifetime in seconds |
 | `MAX_SESSION_HISTORY` | `20` | Max product IDs tracked per session |
 | `ASSOC_WINDOW` | `10` | How many prior session products to associate with each new view |
+| `ASSOC_WEIGHT` | `10` | Score multiplier on PMI-normalized association score |
+| `DECAY_HALF_LIFE_MS` | `2592000000` | Temporal decay half-life (default 30 days) |
+| `SECOND_ORDER_THRESHOLD` | `10` | Candidate count below which second-hop expansion fires |
+| `SECOND_ORDER_DISCOUNT` | `0.3` | Score discount for second-hop candidates |
+| `SECOND_ORDER_HOPS` | `5` | Top-N first-hop neighbours to expand |
 | `MAX_RECOMMENDATIONS` | `10` | Max recommendations returned per request |
+| `ASSOC_BOOTSTRAP_THRESHOLD` | `3` | Strong-association count above which semantic similarity is skipped |
 | `TEXT_SIM_THRESHOLD` | `0.05` | Minimum Jaccard similarity for text-based candidates |
-| `ASSOC_BOOTSTRAP_THRESHOLD` | `3` | Strong-association count above which text similarity is skipped |
+| `DIVERSITY_OVERSAMPLE` | `3` | Candidate over-fetch multiplier before diversity re-rank |
+| `CATEGORY_PENALTY` | `0.5` | Score multiplier per repeated category in output list |
+| `MAX_PER_CATEGORY` | `3` | Hard cap on recommendations from the same category |
+| `EMBEDDING_PROVIDER` | — | `"openai"`, `"ollama"`, or unset (Jaccard fallback) |
+| `OPENAI_API_KEY` | — | Required when `EMBEDDING_PROVIDER=openai` |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
+| `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Ollama embedding model |
+| `VECTOR_SIM_THRESHOLD` | `0.6` | Minimum cosine similarity for vector candidates |
+| `SEMANTIC_CANDIDATES` | `50` | Number of HNSW neighbours to retrieve |
+| `SEMANTIC_WEIGHT` | `5` | Score multiplier on semantic similarity signal |
 
 ---
 
@@ -183,7 +272,11 @@ The recommendations endpoint will be available at `http://localhost:9926/recomme
 
 ### Configure the origin API (optional)
 
-Copy `.env.example` to `.env` and set `ORIGIN_PRODUCT_API_URL`. Without it, the engine works immediately — products are bootstrapped from the `productName` field in POST requests and association learning starts from the first session.
+Copy `.env.example` to `.env` and set `ORIGIN_PRODUCT_API_URL`. Without it the engine works immediately — products are bootstrapped from the `productName` field in POST requests and association learning starts from the first session.
+
+### Enable semantic embeddings (optional)
+
+Set `EMBEDDING_PROVIDER=ollama` (local, free) or `EMBEDDING_PROVIDER=openai` (higher quality) in `.env`. Embeddings are generated lazily — existing recommendations continue working via Jaccard until each product's embedding has been populated.
 
 ### Deploy to Harper Fabric
 
@@ -193,4 +286,4 @@ Create a cluster at [https://fabric.harper.fast/](https://fabric.harper.fast/), 
 npm run deploy
 ```
 
-The component will be deployed with rolling restarts and replication enabled across all nodes in your cluster.
+The component deploys with rolling restarts and full replication across all nodes in your cluster.
