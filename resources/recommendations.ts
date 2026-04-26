@@ -32,6 +32,10 @@ const VECTOR_SIM_THRESHOLD = Number(process.env.VECTOR_SIM_THRESHOLD ?? 0.6);
 const EXPLORE_WEIGHT = Number(process.env.EXPLORE_WEIGHT ?? 0);
 const EXPLORE_FORCE_CANDIDATES = Number(process.env.EXPLORE_FORCE_CANDIDATES ?? MAX_RECOMMENDATIONS);
 
+// Phase 7: session context blending — SESSION_BLEND_WEIGHT=0 disables entirely
+const SESSION_BLEND_WEIGHT = Number(process.env.SESSION_BLEND_WEIGHT ?? 0.5);
+const SESSION_BLEND_WINDOW = Number(process.env.SESSION_BLEND_WINDOW ?? 3);
+
 // ── Text similarity helpers ───────────────────────────────────────────────────
 
 function tokenize(text: string): Set<string> {
@@ -126,8 +130,10 @@ async function touchProductStats(productId: string, delta: number): Promise<void
 async function buildRecommendations(
 	productId: string,
 	currentProduct: Record<string, unknown> | null,
+	sessionHistory: string[],
 ): Promise<unknown[]> {
 	const scores = new Map<string, number>();
+	const sessionHistorySet = new Set(sessionHistory);
 
 	// ── Signal 1: association scoring (Phase 1 decay + Phase 2 PMI) ───────────
 
@@ -158,6 +164,60 @@ async function buildRecommendations(
 		const dw = decayedWeight(assoc.weight as number, assoc.lastSeen as number);
 		const pmiScore = dw / Math.sqrt(currentTotal * targetTotal);
 		scores.set(target, (scores.get(target) ?? 0) + pmiScore * ASSOC_WEIGHT);
+	}
+
+	// ── Signal 1b: session context blending (Phase 7) ────────────────────────
+	// Traverse the association graph from the user's recent session products and
+	// blend their scores in. Makes recommendations reflect the browsing journey
+	// (e.g. "shoes + socks + gels" session surfaces running-themed candidates),
+	// not just the single product being viewed right now.
+
+	if (SESSION_BLEND_WEIGHT > 0 && sessionHistory.length > 0) {
+		const blendSources = sessionHistory.slice(0, SESSION_BLEND_WINDOW);
+
+		const blendAssocLists = await Promise.all(
+			blendSources.map(async (sourceId) => {
+				const results: Array<Record<string, unknown>> = [];
+				for await (const assoc of (tables as any).ProductAssociation.search({
+					conditions: [{ attribute: 'productId', comparator: 'eq', value: sourceId }],
+					limit: 50,
+				})) {
+					results.push(assoc as Record<string, unknown>);
+				}
+				return results;
+			}),
+		);
+
+		// Batch-fetch stats for all sources and their candidates in one round-trip
+		const blendStatsIdSet = new Set<string>(blendSources);
+		for (const assocs of blendAssocLists) {
+			for (const a of assocs) blendStatsIdSet.add(a.associatedProductId as string);
+		}
+		const blendStatsIds = [...blendStatsIdSet];
+		const blendStatsArr = await Promise.all(
+			blendStatsIds.map((id) => (tables as any).ProductStats.get(id).catch(() => null)),
+		);
+		const blendStatsMap = new Map(blendStatsIds.map((id, i) => [id, blendStatsArr[i]]));
+
+		for (let k = 0; k < blendSources.length; k++) {
+			const blendWeight = SESSION_BLEND_WEIGHT / (k + 1);
+			const sourceTotal = Math.max(
+				1,
+				(blendStatsMap.get(blendSources[k])?.totalCoOccurrences as number) ?? 1,
+			);
+
+			for (const assoc of blendAssocLists[k]) {
+				const target = assoc.associatedProductId as string;
+				if (!target || target === productId) continue;
+				const targetTotal = Math.max(
+					1,
+					(blendStatsMap.get(target)?.totalCoOccurrences as number) ?? 1,
+				);
+				const dw = decayedWeight(assoc.weight as number, assoc.lastSeen as number);
+				const pmiScore = dw / Math.sqrt(sourceTotal * targetTotal);
+				scores.set(target, (scores.get(target) ?? 0) + pmiScore * ASSOC_WEIGHT * blendWeight);
+			}
+		}
 	}
 
 	// ── Signal 2: semantic similarity (Phase 5 vector or Jaccard fallback) ────
@@ -225,6 +285,11 @@ async function buildRecommendations(
 
 	scores.delete(productId);
 
+	// Remove products already viewed this session — no value recommending what the user just saw
+	for (const viewedId of sessionHistorySet) {
+		scores.delete(viewedId);
+	}
+
 	// ── Signal 4: UCB exploration bonus (Phase 6) ────────────────────────────
 	// Injects products never recommended before so the association graph can't
 	// self-reinforce into a closed loop of already-popular products.
@@ -238,7 +303,7 @@ async function buildRecommendations(
 			const forcedIds = new Set<string>();
 			for await (const p of (tables as any).Product.search({ limit: EXPLORE_FORCE_CANDIDATES * 3 })) {
 				const pid = (p as any).id as string;
-				if (pid && pid !== productId && !scores.has(pid)) {
+				if (pid && pid !== productId && !scores.has(pid) && !sessionHistorySet.has(pid)) {
 					forcedIds.add(pid);
 					if (forcedIds.size >= EXPLORE_FORCE_CANDIDATES) break;
 				}
@@ -365,13 +430,11 @@ async function handle(productId: string, productName: string) {
 		await updateAssociations(productId, history.slice(0, ASSOC_WINDOW));
 	}
 
-	const newHistory = [productId, ...history.filter((id) => id !== productId)].slice(
-		0,
-		MAX_SESSION_HISTORY,
-	);
+	const priorViews = history.filter((id) => id !== productId);
+	const newHistory = [productId, ...priorViews].slice(0, MAX_SESSION_HISTORY);
 	if (session) session.productHistory = newHistory;
 
-	const recs = await buildRecommendations(productId, product);
+	const recs = await buildRecommendations(productId, product, priorViews);
 
 	// Fire-and-forget: increment recommendationImpressions for each returned product.
 	// Never blocks the response — mirrors the embedding generation pattern in origin-cache.ts.

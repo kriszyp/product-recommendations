@@ -41,7 +41,7 @@ The recommendation model lives entirely inside Harper tables. There is no separa
 
 ## Recommendation Techniques
 
-The engine stacks seven complementary techniques. Each one addresses a different failure mode of simple co-occurrence counting, and they compose cleanly because they all operate on the same Harper tables.
+The engine stacks eight complementary techniques. Each one addresses a different failure mode of simple co-occurrence counting, and they compose cleanly because they all operate on the same Harper tables.
 
 ### 1. Session co-occurrence graph (primary signal)
 
@@ -128,6 +128,24 @@ finalScore = rawScore + EXPLORE_WEIGHT × ( 1 / √(1 + impressions) )
 
 Each recommendation response includes an `explored` field per item, set to `true` when the exploration bonus exceeded the raw exploitation score. This lets callers render exploration slots differently (e.g. "You might also like" vs "Frequently bought together") and supports offline analysis of whether explored items convert.
 
+### 8. Session personalization
+
+The previous seven signals are all evaluated against the *single product being viewed*. But users browse in journeys, not in isolation. A user who has been looking at trail shoes → compression socks → energy gels should get recommendations that reflect the *running theme* of their session, not just the gels product in isolation.
+
+**Session context blending** traverses the association graph from the user's recently-viewed products and merges their scores into the candidate pool, weighted by recency:
+
+```
+blendContribution(k, B) = score(sessionProduct_k → B) × SESSION_BLEND_WEIGHT / (k + 1)
+```
+
+`k = 0` is the most recently viewed product before the current one. The contribution halves for each step back in history, matching the same intuition as within-session recency weighting. With `SESSION_BLEND_WEIGHT=0.5` (the default), the most recent prior product can contribute up to half as much as the current product's direct associations — a meaningful personalization signal that never overrides the primary signal.
+
+`SESSION_BLEND_WINDOW` (default 3) caps how many prior products are traversed to bound the extra read cost. Worst case is `3 × 50 = 150` additional Harper reads per request, all served from local storage.
+
+**Viewed-product exclusion** runs alongside blending: products already in the user's session history are always removed from the candidate pool before re-ranking. There is no value recommending something the user just viewed. This is a hard filter applied after all scoring, so it does not interfere with blending (a session product's *neighbours* can still score highly; only the session product itself is excluded).
+
+When `SESSION_BLEND_WEIGHT=0`, the entire blending block is skipped and exclusion still applies.
+
 ### How the signals combine
 
 All signals feed into a single `scores` map. The final score going into diversity re-ranking is:
@@ -137,7 +155,10 @@ All signals feed into a single `scores` map. The final score going into diversit
 | Association (PMI-normalized) | `decayedWeight(A→B) / √(totalA × totalB) × ASSOC_WEIGHT` | 0–10 |
 | Second-order (indirect) | `firstHopScore × decayedWeight(B→C) × SECOND_ORDER_DISCOUNT` | 0–3 |
 | Semantic (vector or Jaccard) | `similarity × SEMANTIC_WEIGHT` | 0–5 |
+| Session blend | `score(sessionProduct_k → B) × SESSION_BLEND_WEIGHT / (k+1)` | 0–5 |
 | Exploration bonus | `EXPLORE_WEIGHT / √(1 + impressions)` | 0–`EXPLORE_WEIGHT` |
+
+Products already in the user's session history are excluded from candidates before re-ranking regardless of their scores.
 
 Before the diversity re-ranker, scores are min-max normalized to a 0–100 range across the candidate pool. The `score` field in the API response reflects this normalized value.
 
@@ -274,6 +295,8 @@ All tuning parameters are set via environment variables. Copy `.env.example` to 
 | `DIVERSITY_OVERSAMPLE` | `3` | Candidate over-fetch multiplier before diversity re-rank |
 | `CATEGORY_PENALTY` | `0.5` | Score multiplier per repeated category in output list |
 | `MAX_PER_CATEGORY` | `3` | Hard cap on recommendations from the same category |
+| `SESSION_BLEND_WEIGHT` | `0.5` | Score multiplier for session context blend; 0 = disabled (current product only) |
+| `SESSION_BLEND_WINDOW` | `3` | How many prior session products to blend associations from |
 | `EXPLORE_WEIGHT` | `0` | UCB exploration bonus multiplier; 0 = disabled. Setting equal to `SEMANTIC_WEIGHT` (5) is a good starting point |
 | `EXPLORE_FORCE_CANDIDATES` | `10` | Max products with no prior signal to inject as exploration candidates per request; 0 = only boost already-scored products |
 | `EMBEDDING_PROVIDER` | — | `"openai"`, `"ollama"`, or unset (Jaccard fallback) |
