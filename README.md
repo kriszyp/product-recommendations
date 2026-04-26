@@ -4,9 +4,44 @@ A Harper application that delivers real-time, low-latency product recommendation
 
 ---
 
+## Why Harper Is a Good Fit
+
+### Low-latency at the edge
+
+Deployed to a Harper Fabric cluster, the product graph and product cache are replicated across every node globally. A user in Tokyo and a user in London both read from their nearest node — no round-trip to a central database. Recommendation lookups are served from local in-process storage.
+
+### Associations update in real time across the cluster
+
+Harper's replication propagates association weight increments across the cluster automatically. A browsing pattern that appears on nodes in Frankfurt immediately strengthens the same association edges on nodes in Singapore. The recommendation model improves globally without any centralised aggregation step or batch retraining.
+
+### Composition with Harper's page and API caching
+
+This component is designed to sit alongside Harper's built-in caching components. A typical e-commerce setup might look like:
+
+```
+Browser
+  │
+  ▼
+Harper Node (nearest)
+  ├─ Static assets        (Harper static component — served from edge)
+  ├─ Product detail page  (Harper HTTP cache — full page or fragment cache)
+  ├─ Product API          (Harper cache component — cached origin API responses)
+  └─ /recommendations/    (this component — live, session-aware, no cache)
+```
+
+The recommendation endpoint is intentionally not cached at the HTTP layer — each request is session-specific and must read the current association graph. However, the underlying `Product` and `ProductAssociation` table lookups are served from Harper's in-process storage, so individual record reads are already as fast as a cache hit.
+
+For higher-traffic deployments, recommendations for anonymous (cookieless) users can be cached per product ID at the page layer, since those requests carry no session context. Personalised responses bypass the page cache automatically.
+
+### No external ML infrastructure required
+
+The recommendation model lives entirely inside Harper tables. There is no separate vector database, no offline training pipeline, no model serving infrastructure, and no scheduled jobs. The association graph and popularity statistics are updated inline with every request using Harper's atomic increment operations. Deploying the recommendation engine is just deploying a Harper component.
+
+---
+
 ## Recommendation Techniques
 
-The engine stacks five complementary techniques. Each one addresses a different failure mode of simple co-occurrence counting, and they compose cleanly because they all operate on the same two Harper tables.
+The engine stacks seven complementary techniques. Each one addresses a different failure mode of simple co-occurrence counting, and they compose cleanly because they all operate on the same Harper tables.
 
 ### 1. Session co-occurrence graph (primary signal)
 
@@ -75,15 +110,34 @@ After building the scored candidate pool, the engine **over-fetches** `MAX_RECOM
 
 Products without a `category` field share an `__unknown__` bucket. The re-ranker is O(candidates × targetCount) with category data fetched in the same `Promise.all` batch as the final product detail reads, so it adds no extra round-trips.
 
+### 7. UCB-style exploration (anti-feedback-loop)
+
+The association graph has a self-reinforcing property: highly-associated products get recommended → users view them → their edge weights grow → they get recommended even more. Products that never enter the graph never accumulate associations and stay invisible forever, regardless of their actual relevance.
+
+The engine applies a **Upper Confidence Bound (UCB)-style exploration bonus** before normalization to counter this:
+
+```
+finalScore = rawScore + EXPLORE_WEIGHT × ( 1 / √(1 + impressions) )
+```
+
+`impressions` is the number of times a product has appeared in a recommendation response, tracked atomically in `ProductStats.recommendationImpressions`. The bonus is large when a product is unseen (`impressions = 0` → bonus = 1.0) and shrinks as it accumulates exposure (`impressions = 99` → bonus ≈ 0.1). Products that have earned strong associations are not suppressed — their exploitation score outweighs the bonus of less-seen alternatives.
+
+**Forced cold-start candidates:** Setting `EXPLORE_FORCE_CANDIDATES > 0` injects products with no prior association or semantic signal (raw score = 0) directly into the candidate pool before the diversity re-ranker. Without this, a product that has never been recommended can never earn impressions and is permanently invisible to the UCB formula. Forced candidates are given `score = 0` then lifted by the exploration bonus, so they can only appear if the bonus is large enough to survive the diversity re-rank.
+
+**Zero overhead when disabled:** `EXPLORE_WEIGHT=0` (the default) skips the entire block — no extra reads, no allocation, identical behaviour to a deployment without the feature.
+
+Each recommendation response includes an `explored` field per item, set to `true` when the exploration bonus exceeded the raw exploitation score. This lets callers render exploration slots differently (e.g. "You might also like" vs "Frequently bought together") and supports offline analysis of whether explored items convert.
+
 ### How the signals combine
 
-All six signals feed into a single `scores` map. The final score going into diversity re-ranking is:
+All signals feed into a single `scores` map. The final score going into diversity re-ranking is:
 
 | Signal | Formula | Scale |
 |---|---|---|
 | Association (PMI-normalized) | `decayedWeight(A→B) / √(totalA × totalB) × ASSOC_WEIGHT` | 0–10 |
 | Second-order (indirect) | `firstHopScore × decayedWeight(B→C) × SECOND_ORDER_DISCOUNT` | 0–3 |
 | Semantic (vector or Jaccard) | `similarity × SEMANTIC_WEIGHT` | 0–5 |
+| Exploration bonus | `EXPLORE_WEIGHT / √(1 + impressions)` | 0–`EXPLORE_WEIGHT` |
 
 Before the diversity re-ranker, scores are min-max normalized to a 0–100 range across the candidate pool. The `score` field in the API response reflects this normalized value.
 
@@ -130,49 +184,25 @@ curl -X POST http://localhost:9926/recommendations/ \
       "price": 24.99,
       "category": "Accessories",
       "imageUrl": "...",
-      "score": 84.2
+      "score": 84.2,
+      "explored": false
+    },
+    {
+      "id": "prod-new-789",
+      "name": "Trail Running Vest",
+      "description": "...",
+      "price": 59.99,
+      "category": "Apparel",
+      "imageUrl": "...",
+      "score": 31.4,
+      "explored": true
     }
   ],
   "sessionHistory": ["prod-abc-123", "prod-xyz-789"]
 }
 ```
 
-`score` is normalized to 0–100 within the response's candidate pool. Higher means a stronger combined signal.
-
----
-
-## Why Harper Is a Good Fit
-
-### Low-latency at the edge
-
-Deployed to a Harper Fabric cluster, the product graph and product cache are replicated across every node globally. A user in Tokyo and a user in London both read from their nearest node — no round-trip to a central database. Recommendation lookups are served from local in-process storage.
-
-### Associations update in real time across the cluster
-
-Harper's replication propagates association weight increments across the cluster automatically. A browsing pattern that appears on nodes in Frankfurt immediately strengthens the same association edges on nodes in Singapore. The recommendation model improves globally without any centralised aggregation step or batch retraining.
-
-### Composition with Harper's page and API caching
-
-This component is designed to sit alongside Harper's built-in caching components. A typical e-commerce setup might look like:
-
-```
-Browser
-  │
-  ▼
-Harper Node (nearest)
-  ├─ Static assets        (Harper static component — served from edge)
-  ├─ Product detail page  (Harper HTTP cache — full page or fragment cache)
-  ├─ Product API          (Harper cache component — cached origin API responses)
-  └─ /recommendations/    (this component — live, session-aware, no cache)
-```
-
-The recommendation endpoint is intentionally not cached at the HTTP layer — each request is session-specific and must read the current association graph. However, the underlying `Product` and `ProductAssociation` table lookups are served from Harper's in-process storage, so individual record reads are already as fast as a cache hit.
-
-For higher-traffic deployments, recommendations for anonymous (cookieless) users can be cached per product ID at the page layer, since those requests carry no session context. Personalised responses bypass the page cache automatically.
-
-### No external ML infrastructure required
-
-The recommendation model lives entirely inside Harper tables. There is no separate vector database, no offline training pipeline, no model serving infrastructure, and no scheduled jobs. The association graph and popularity statistics are updated inline with every request using Harper's atomic increment operations. Deploying the recommendation engine is just deploying a Harper component.
+`score` is normalized to 0–100 within the response's candidate pool. `explored: true` means the exploration bonus exceeded the raw exploitation score for that item — the engine is deliberately surfacing an under-exposed product. When `EXPLORE_WEIGHT=0` (the default), `explored` is always `false`.
 
 ---
 
@@ -211,13 +241,14 @@ Learned co-occurrence edges. Both directions `A→B` and `B→A` are stored so q
 
 ### `ProductStats` table
 
-Per-product aggregate co-occurrence totals for PMI normalization. Access is always by primary key.
+Per-product aggregate statistics for PMI normalization and exploration tracking. Access is always by primary key.
 
 | Field | Type | Notes |
 |---|---|---|
 | `id` | ID | Mirrors `Product.id` |
 | `totalCoOccurrences` | Float | Running sum of all outbound association increments |
 | `lastUpdated` | Float | |
+| `recommendationImpressions` | Float | Times this product appeared in a recommendation response; `null` treated as 0 |
 
 ---
 
@@ -243,6 +274,8 @@ All tuning parameters are set via environment variables. Copy `.env.example` to 
 | `DIVERSITY_OVERSAMPLE` | `3` | Candidate over-fetch multiplier before diversity re-rank |
 | `CATEGORY_PENALTY` | `0.5` | Score multiplier per repeated category in output list |
 | `MAX_PER_CATEGORY` | `3` | Hard cap on recommendations from the same category |
+| `EXPLORE_WEIGHT` | `0` | UCB exploration bonus multiplier; 0 = disabled. Setting equal to `SEMANTIC_WEIGHT` (5) is a good starting point |
+| `EXPLORE_FORCE_CANDIDATES` | `10` | Max products with no prior signal to inject as exploration candidates per request; 0 = only boost already-scored products |
 | `EMBEDDING_PROVIDER` | — | `"openai"`, `"ollama"`, or unset (Jaccard fallback) |
 | `OPENAI_API_KEY` | — | Required when `EMBEDDING_PROVIDER=openai` |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
