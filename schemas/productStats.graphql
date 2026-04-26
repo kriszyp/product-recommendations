@@ -1,0 +1,9 @@
+# Per-product aggregate co-occurrence statistics used for PMI popularity normalization.
+# Written atomically via ProductStats.update(id).addTo('totalCoOccurrences', delta).
+# Access is always by primary key — no secondary indexes needed.
+# Not @export: managed exclusively by the recommendations resource.
+type ProductStats @table {
+	id: ID @primaryKey
+	totalCoOccurrences: Float
+	lastUpdated: Float
+}

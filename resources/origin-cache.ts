@@ -9,6 +9,7 @@
  */
 
 import { Resource, tables } from 'harper';
+import { generateEmbedding, EMBEDDING_VERSION } from './embeddings.ts';
 
 const ORIGIN_API_URL = process.env.ORIGIN_PRODUCT_API_URL ?? '';
 const ORIGIN_API_KEY = process.env.ORIGIN_PRODUCT_API_KEY ?? '';
@@ -54,7 +55,7 @@ export function normalizeOriginProduct(
 		...new Set(tokenize([name, description, category, sku].filter(Boolean).join(' '))),
 	].join(' ');
 
-	return {
+	const product = {
 		id: productId,
 		name,
 		description,
@@ -66,6 +67,22 @@ export function normalizeOriginProduct(
 		fetchedAt: Date.now(),
 		textContent,
 	};
+
+	// Phase 5: generate and persist embedding lazily — fire-and-forget, never blocks the response
+	if (EMBEDDING_VERSION) {
+		generateEmbedding(textContent)
+			.then((vec) => {
+				if (vec) {
+					(tables as any).Product.patch(productId, {
+						textEmbedding: vec,
+						embeddingVersion: EMBEDDING_VERSION,
+					}).catch(() => {});
+				}
+			})
+			.catch(() => {});
+	}
+
+	return product;
 }
 
 // ── Source resource (not exported → no HTTP endpoint) ─────────────────────────

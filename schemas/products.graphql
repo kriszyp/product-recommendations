@@ -12,4 +12,7 @@ type Product @table(expiration: 86400) {
 	metadata: String
 	fetchedAt: Float
 	textContent: String
+	# Phase 5: optional HNSW vector for semantic similarity — populated lazily when EMBEDDING_PROVIDER is set
+	textEmbedding: [Float] @indexed(type: "HNSW", distance: "cosine")
+	embeddingVersion: String
 }
