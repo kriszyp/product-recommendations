@@ -28,6 +28,10 @@ const SEMANTIC_WEIGHT = Number(process.env.SEMANTIC_WEIGHT ?? 5);
 const SEMANTIC_CANDIDATES = Number(process.env.SEMANTIC_CANDIDATES ?? 50);
 const VECTOR_SIM_THRESHOLD = Number(process.env.VECTOR_SIM_THRESHOLD ?? 0.6);
 
+// Phase 6: UCB-style exploration — EXPLORE_WEIGHT=0 disables entirely (no behaviour change)
+const EXPLORE_WEIGHT = Number(process.env.EXPLORE_WEIGHT ?? 0);
+const EXPLORE_FORCE_CANDIDATES = Number(process.env.EXPLORE_FORCE_CANDIDATES ?? MAX_RECOMMENDATIONS);
+
 // ── Text similarity helpers ───────────────────────────────────────────────────
 
 function tokenize(text: string): Set<string> {
@@ -221,6 +225,50 @@ async function buildRecommendations(
 
 	scores.delete(productId);
 
+	// ── Signal 4: UCB exploration bonus (Phase 6) ────────────────────────────
+	// Injects products never recommended before so the association graph can't
+	// self-reinforce into a closed loop of already-popular products.
+
+	let rawScores: Map<string, number> | undefined;
+	let exploreStatsMap: Map<string, Record<string, unknown> | null> | undefined;
+
+	if (EXPLORE_WEIGHT > 0) {
+		// Forced-exploration candidates: products with no association/similarity signal
+		if (EXPLORE_FORCE_CANDIDATES > 0) {
+			const forcedIds = new Set<string>();
+			for await (const p of (tables as any).Product.search({ limit: EXPLORE_FORCE_CANDIDATES * 3 })) {
+				const pid = (p as any).id as string;
+				if (pid && pid !== productId && !scores.has(pid)) {
+					forcedIds.add(pid);
+					if (forcedIds.size >= EXPLORE_FORCE_CANDIDATES) break;
+				}
+			}
+			for (const pid of forcedIds) scores.set(pid, 0);
+		}
+
+		// Batch-fetch ProductStats for all candidates.
+		// Seed from the already-fetched candidateStats to avoid redundant reads.
+		exploreStatsMap = new Map<string, Record<string, unknown> | null>();
+		assocResults.forEach((a, i) =>
+			exploreStatsMap!.set(a.associatedProductId as string, candidateStats[i]),
+		);
+		const missingIds = [...scores.keys()].filter((id) => !exploreStatsMap!.has(id));
+		const missingStats = await Promise.all(
+			missingIds.map((id) => (tables as any).ProductStats.get(id).catch(() => null)),
+		);
+		missingIds.forEach((id, i) => exploreStatsMap!.set(id, missingStats[i]));
+
+		// Save raw exploitation scores, then apply UCB bonus
+		rawScores = new Map(scores);
+		for (const [id, raw] of scores) {
+			const impressions = Math.max(
+				0,
+				(exploreStatsMap.get(id)?.recommendationImpressions as number) ?? 0,
+			);
+			scores.set(id, raw + EXPLORE_WEIGHT / Math.sqrt(1 + impressions));
+		}
+	}
+
 	// ── Phase 4: diversity re-ranking ─────────────────────────────────────────
 
 	const oversampleCount = MAX_RECOMMENDATIONS * DIVERSITY_OVERSAMPLE;
@@ -276,6 +324,20 @@ async function buildRecommendations(
 		categoryCounts.set(cat, (categoryCounts.get(cat) ?? 0) + 1);
 	}
 
+	// Mark items where the exploration bonus exceeded the exploitation score
+	const explorationBoosted = new Set<string>(
+		EXPLORE_WEIGHT > 0 && rawScores && exploreStatsMap
+			? selected.map((c) => c.id).filter((id) => {
+					const raw = rawScores!.get(id) ?? 0;
+					const impressions = Math.max(
+						0,
+						(exploreStatsMap!.get(id)?.recommendationImpressions as number) ?? 0,
+					);
+					return EXPLORE_WEIGHT / Math.sqrt(1 + impressions) > raw;
+				})
+			: [],
+	);
+
 	return selected.map(({ id, normalizedScore }) => {
 		const p = productMap.get(id);
 		return {
@@ -286,6 +348,7 @@ async function buildRecommendations(
 			category: p?.category ?? '',
 			imageUrl: p?.imageUrl ?? '',
 			score: normalizedScore,
+			explored: explorationBoosted.has(id),
 		};
 	});
 }
@@ -309,6 +372,28 @@ async function handle(productId: string, productName: string) {
 	if (session) session.productHistory = newHistory;
 
 	const recs = await buildRecommendations(productId, product);
+
+	// Fire-and-forget: increment recommendationImpressions for each returned product.
+	// Never blocks the response — mirrors the embedding generation pattern in origin-cache.ts.
+	Promise.all(
+		(recs as Array<{ id: string }>).map((rec) =>
+			(async () => {
+				try {
+					const s = await (tables as any).ProductStats.update(rec.id);
+					s.addTo('recommendationImpressions', 1);
+				} catch {
+					await (tables as any).ProductStats
+						.put(rec.id, {
+							id: rec.id,
+							totalCoOccurrences: 0,
+							recommendationImpressions: 1,
+							lastUpdated: Date.now(),
+						})
+						.catch(() => {});
+				}
+			})(),
+		),
+	).catch(() => {});
 
 	return {
 		productId,

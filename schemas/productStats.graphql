@@ -6,4 +6,5 @@ type ProductStats @table {
 	id: ID @primaryKey
 	totalCoOccurrences: Float
 	lastUpdated: Float
+	recommendationImpressions: Float
 }
